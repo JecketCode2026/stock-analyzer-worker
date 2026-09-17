@@ -2,7 +2,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 路由 1：处理登录与 Cloudflare Turnstile 验证
+    // 路由 1：处理登录
     if (url.pathname === '/api/login' && request.method === 'POST') {
       return handleLogin(request, env);
     }
@@ -25,35 +25,20 @@ export default {
     }
 
     // 路由 3：提供前端 UI 页面
-    return new Response(getHTMLPage(env), {
+    return new Response(getHTMLPage(), {
       headers: { 'Content-Type': 'text/html;charset=UTF-8' }
     });
   }
 };
 
 /**
- * 处理登录与 Cloudflare Turnstile 人机校验
+ * 处理用户登录验证
  */
 async function handleLogin(request, env) {
   try {
-    const { username, password, turnstileToken } = await request.json();
+    const { username, password } = await request.json();
 
-    // 1. 校验 Turnstile 人机验证 Token
-    const turnstileSecret = env.TURNSTILE_SECRET_KEY || '1x0000000000000000000000000000000AA'; // 默认测试 Secret Key
-    const verifyRes = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        secret: turnstileSecret,
-        response: turnstileToken
-      })
-    });
-    const verifyOutcome = await verifyRes.json();
-    if (!verifyOutcome.success) {
-      return new Response(JSON.stringify({ error: '机器人人机验证失败，请重试' }), { status: 400 });
-    }
-
-    // 2. 账号密码校验 (可在 Cloudflare 环境变量中配置 ADMIN_USER / ADMIN_PASS，默认: admin / admin123)
+    // 账号密码校验 (可在 Cloudflare 环境变量中配置 ADMIN_USER / ADMIN_PASS，默认: admin / admin123)
     const validUser = env.ADMIN_USER || 'admin';
     const validPass = env.ADMIN_PASS || 'admin123';
 
@@ -72,7 +57,7 @@ async function handleLogin(request, env) {
 }
 
 /**
- * SSE 实时数据推送与多源计算 (解决 GBK 乱码、追加技术指标与行业信息)
+ * SSE 实时数据推送与技术指标计算
  */
 function handleSSEAnalysis(rawSymbol) {
   const { readable, writable } = new TransformStream();
@@ -88,8 +73,8 @@ function handleSSEAnalysis(rawSymbol) {
     try {
       const targetSymbol = formatSymbolForTencent(rawSymbol);
 
-      // 阶段 1：获取实时行情数据并修复 GBK 乱码
-      await sendEvent('progress', { percent: 25, message: `[1/3] 正在拉取 ${rawSymbol.toUpperCase()} 行情数据（GBK转码中）...` });
+      // 阶段 1：获取实时行情数据并进行 GBK 解码
+      await sendEvent('progress', { percent: 25, message: `[1/3] 正在拉取 ${rawSymbol.toUpperCase()} 行情数据...` });
       
       const res = await fetch(`https://qt.gtimg.cn/q=${targetSymbol}`, {
         headers: {
@@ -100,15 +85,14 @@ function handleSSEAnalysis(rawSymbol) {
 
       if (!res.ok) throw new Error(`数据源连接失败 (HTTP ${res.status})`);
 
-      // 关键修复：采用 TextDecoder('gbk') 解析 GBK 字节流，解决中文乱码
       const buffer = await res.arrayBuffer();
       const text = new TextDecoder('gbk').decode(buffer);
       const baseData = parseTencentStockData(rawSymbol, text);
 
       if (!baseData) throw new Error(`无法找到代码 "${rawSymbol}" 的有效股票信息。`);
 
-      // 阶段 2：获取日 K 线历史数据并计算 MA / RSI 技术指标
-      await sendEvent('progress', { percent: 65, message: `[2/3] 计算均线 (MA5/10/20)、RSI 与行业技术指标...` });
+      // 阶段 2：计算 MA5/10/20 及 RSI 指标
+      await sendEvent('progress', { percent: 65, message: `[2/3] 计算均线 (MA5/10/20) 与 RSI 技术指标...` });
       
       const klineRes = await fetch(`https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${targetSymbol},day,,,30,qfq`);
       let technicals = { ma5: 'N/A', ma10: 'N/A', ma20: 'N/A', rsi14: 'N/A', trend: '震荡整理', sector: '通用板块' };
@@ -122,7 +106,7 @@ function handleSSEAnalysis(rawSymbol) {
         }
       }
 
-      // 阶段 3：整合数据并输出结果
+      // 阶段 3：整合数据并输出
       await sendEvent('progress', { percent: 95, message: `[3/3] 生成分析仪表盘...` });
       
       const finalResult = { ...baseData, ...technicals };
@@ -162,7 +146,7 @@ function parseTencentStockData(rawSymbol, text) {
   const parts = match[1].split('~');
   if (parts.length < 30) return null;
 
-  const name = parts[1] || rawSymbol; // 已通过 GBK 正确解码
+  const name = parts[1] || rawSymbol;
   const currentPrice = parseFloat(parts[3]) || 0;
   const prevClose = parseFloat(parts[4]) || 0;
   const openPrice = parseFloat(parts[5]) || 0;
@@ -212,9 +196,6 @@ function parseTencentStockData(rawSymbol, text) {
   };
 }
 
-/**
- * 根据历史 K 线实时计算技术指标 (MA5/10/20 & RSI14)
- */
 function calculateTechnicalIndicators(kdata) {
   const closes = kdata.map(item => parseFloat(item[2]));
   const len = closes.length;
@@ -232,7 +213,6 @@ function calculateTechnicalIndicators(kdata) {
   const ma20 = getMA(20);
   const current = closes[len - 1];
 
-  // 计算 RSI(14)
   let rsi14 = 'N/A';
   if (len >= 15) {
     let gains = 0, losses = 0;
@@ -250,7 +230,6 @@ function calculateTechnicalIndicators(kdata) {
     }
   }
 
-  // 趋势推断
   let trend = '震荡整理';
   if (ma5 !== 'N/A' && ma20 !== 'N/A') {
     if (current > parseFloat(ma5) && parseFloat(ma5) > parseFloat(ma20)) trend = '多头排列 (看涨)';
@@ -261,11 +240,9 @@ function calculateTechnicalIndicators(kdata) {
 }
 
 /**
- * 前端 UI (集成 Turnstile 校验 + 登录弹窗 + 技术指标卡片)
+ * 前端界面 UI
  */
-function getHTMLPage(env) {
-  const turnstileSiteKey = env.TURNSTILE_SITE_KEY || '1x00000000000000000000AA'; // 默认测试 Site Key
-
+function getHTMLPage() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -274,8 +251,6 @@ function getHTMLPage(env) {
   <title>个股智能分析看板</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <!-- Cloudflare Turnstile 脚本 -->
-  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 </head>
 <body class="bg-slate-900 text-slate-100 min-h-screen">
 
@@ -284,7 +259,7 @@ function getHTMLPage(env) {
     <div class="bg-slate-800 border border-slate-700 p-8 rounded-2xl w-full max-w-md shadow-2xl space-y-6">
       <div class="text-center">
         <h2 class="text-2xl font-bold text-white mb-1"><i class="fa-solid fa-lock text-blue-400 me-2"></i>系统登录</h2>
-        <p class="text-slate-400 text-sm">请输入凭证并完成 Cloudflare 机器人验证</p>
+        <p class="text-slate-400 text-sm">请输入账号凭证以访问分析服务</p>
       </div>
 
       <form id="loginForm" class="space-y-4">
@@ -297,15 +272,10 @@ function getHTMLPage(env) {
           <input type="password" id="password" value="admin123" class="w-full px-4 py-2.5 rounded-lg bg-slate-900 border border-slate-700 text-white focus:outline-none focus:ring-2 focus:ring-blue-500" required>
         </div>
 
-        <!-- Cloudflare Turnstile 组件 -->
-        <div class="flex justify-center pt-2">
-          <div class="cf-turnstile" data-sitekey="${turnstileSiteKey}"></div>
-        </div>
-
         <div id="loginError" class="hidden text-red-400 text-xs text-center"></div>
 
         <button type="submit" id="loginBtn" class="w-full py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition-colors">
-          安全登录
+          登录
         </button>
       </form>
     </div>
@@ -326,7 +296,6 @@ function getHTMLPage(env) {
       </div>
     </header>
 
-    <!-- 搜索区域 -->
     <section class="max-w-md mx-auto mb-8">
       <form id="searchForm" class="flex gap-2">
         <input 
@@ -343,7 +312,6 @@ function getHTMLPage(env) {
       </form>
     </section>
 
-    <!-- 进度条 -->
     <div id="progressContainer" class="hidden max-w-2xl mx-auto mb-10 bg-slate-800/80 border border-slate-700/60 p-6 rounded-xl shadow-xl backdrop-blur">
       <div class="flex justify-between text-sm font-medium mb-2">
         <span id="progressStatus" class="text-blue-400">正在建立连接...</span>
@@ -356,10 +324,7 @@ function getHTMLPage(env) {
 
     <div id="errorMessage" class="hidden max-w-2xl mx-auto mb-8 bg-red-900/40 border border-red-500/50 text-red-200 p-4 rounded-xl text-center text-sm"></div>
 
-    <!-- 看板内容 -->
     <main id="dashboard" class="hidden space-y-6">
-      
-      <!-- 股票基础头部 -->
       <div class="bg-slate-800 border border-slate-700/60 rounded-xl p-6 flex flex-col md:flex-row justify-between md:items-center gap-4">
         <div>
           <div class="flex items-center gap-3">
@@ -375,7 +340,6 @@ function getHTMLPage(env) {
         </div>
       </div>
 
-      <!-- 核心估值与量价关系网格 -->
       <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
         <div class="bg-slate-800/60 border border-slate-700/50 rounded-xl p-4">
           <div class="text-xs text-slate-400 mb-1">总市值</div>
@@ -395,10 +359,7 @@ function getHTMLPage(env) {
         </div>
       </div>
 
-      <!-- 新增：技术指标与资信状态板块 -->
       <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-        
-        <!-- 技术指标分析 -->
         <div class="bg-slate-800/60 border border-slate-700/50 rounded-xl p-5 space-y-3">
           <h3 class="text-sm font-semibold text-blue-400 uppercase tracking-wider border-b border-slate-700 pb-2">
             <i class="fa-solid fa-chart-simple me-1.5"></i>技术指标与均线系统
@@ -425,7 +386,6 @@ function getHTMLPage(env) {
           </div>
         </div>
 
-        <!-- 价格分布与波动性 -->
         <div class="bg-slate-800/60 border border-slate-700/50 rounded-xl p-5 space-y-3">
           <h3 class="text-sm font-semibold text-emerald-400 uppercase tracking-wider border-b border-slate-700 pb-2">
             <i class="fa-solid fa-arrows-up-down me-1.5"></i>价格范围与振幅
@@ -447,7 +407,6 @@ function getHTMLPage(env) {
             <span id="volume" class="font-mono text-slate-200">--</span>
           </div>
         </div>
-
       </div>
     </main>
 
@@ -461,7 +420,6 @@ function getHTMLPage(env) {
     const userName = document.getElementById('userName');
     const logoutBtn = document.getElementById('logoutBtn');
 
-    // 状态初始化
     if (authToken) {
       loginModal.classList.add('hidden');
       userInfo.classList.remove('hidden');
@@ -473,23 +431,13 @@ function getHTMLPage(env) {
       const loginError = document.getElementById('loginError');
       loginError.classList.add('hidden');
 
-      const formData = new FormData(e.target);
-      const turnstileResponse = formData.get('cf-turnstile-response');
-
-      if (!turnstileResponse) {
-        loginError.textContent = '请先完成 Cloudflare 人机安全验证';
-        loginError.classList.remove('hidden');
-        return;
-      }
-
       try {
         const res = await fetch('/api/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             username: document.getElementById('username').value,
-            password: document.getElementById('password').value,
-            turnstileToken: turnstileResponse
+            password: document.getElementById('password').value
           })
         });
 
@@ -517,7 +465,6 @@ function getHTMLPage(env) {
       location.reload();
     });
 
-    // 股票分析逻辑
     const searchForm = document.getElementById('searchForm');
     const symbolInput = document.getElementById('symbolInput');
     const submitBtn = document.getElementById('submitBtn');
@@ -544,7 +491,7 @@ function getHTMLPage(env) {
       submitBtn.disabled = true;
       submitBtn.classList.add('opacity-50');
       
-      updateProgress(0, '建立鉴权连接...');
+      updateProgress(0, '建立连接...');
 
       const eventSource = new EventSource(\`/api/analyze?symbol=\${encodeURIComponent(symbol)}&token=\${encodeURIComponent(authToken)}\`);
 
@@ -594,7 +541,7 @@ function getHTMLPage(env) {
     }
 
     function renderDashboard(data) {
-      document.getElementById('stockName').textContent = data.shortName; // 中文正常显示的股票名
+      document.getElementById('stockName').textContent = data.shortName;
       document.getElementById('stockSymbol').textContent = data.symbol;
       document.getElementById('stockExchange').textContent = data.exchangeName;
       document.getElementById('sectorName').textContent = data.sector;
@@ -613,14 +560,12 @@ function getHTMLPage(env) {
       document.getElementById('pbRatio').textContent = data.pbRatio;
       document.getElementById('turnoverRate').textContent = data.turnoverRate;
 
-      // 技术指标
       document.getElementById('trendStatus').textContent = data.trend;
       document.getElementById('ma5').textContent = data.ma5;
       document.getElementById('ma10').textContent = data.ma10;
       document.getElementById('ma20').textContent = data.ma20;
       document.getElementById('rsi14').textContent = data.rsi14;
 
-      // 波动区间
       document.getElementById('openPrev').textContent = \`\${data.openPrice} / \${data.prevClose}\`;
       document.getElementById('highLow').textContent = \`\${data.fiftyTwoWeekHigh} / \${data.fiftyTwoWeekLow}\`;
       document.getElementById('amplitude').textContent = data.amplitude;

@@ -7,10 +7,12 @@ export default {
       return handleLogin(request, env);
     }
 
-    // 路由 2：个股分析 SSE 接口 (需要 Auth Token 验证)
+    // 路由 2：个股分析 SSE 接口 (修复鉴权 Token 解析逻辑)
     if (url.pathname === '/api/analyze') {
-      const authHeader = request.headers.get('Authorization') || url.searchParams.get('token');
-      if (!authHeader || authHeader !== 'Bearer worker-auth-valid-token') {
+      const rawToken = request.headers.get('Authorization') || url.searchParams.get('token') || '';
+      const token = rawToken.replace(/^Bearer\s+/i, '').trim();
+
+      if (token !== 'worker-auth-valid-token') {
         return new Response(JSON.stringify({ error: '未经授权，请先登录' }), {
           status: 401,
           headers: { 'Content-Type': 'application/json' }
@@ -38,7 +40,6 @@ async function handleLogin(request, env) {
   try {
     const { username, password } = await request.json();
 
-    // 账号密码校验 (可在 Cloudflare 环境变量中配置 ADMIN_USER / ADMIN_PASS，默认: admin / admin123)
     const validUser = env.ADMIN_USER || 'admin';
     const validPass = env.ADMIN_PASS || 'admin123';
 
@@ -73,8 +74,8 @@ function handleSSEAnalysis(rawSymbol) {
     try {
       const targetSymbol = formatSymbolForTencent(rawSymbol);
 
-      // 阶段 1：获取实时行情数据并进行 GBK 解码
-      await sendEvent('progress', { percent: 25, message: `[1/3] 正在拉取 ${rawSymbol.toUpperCase()} 行情数据...` });
+      // 阶段 1：获取实时行情数据并解析 GBK 字节流
+      await sendEvent('progress', { percent: 25, message: `[1/3] 拉取 ${rawSymbol.toUpperCase()} 行情数据...` });
       
       const res = await fetch(`https://qt.gtimg.cn/q=${targetSymbol}`, {
         headers: {
@@ -89,25 +90,28 @@ function handleSSEAnalysis(rawSymbol) {
       const text = new TextDecoder('gbk').decode(buffer);
       const baseData = parseTencentStockData(rawSymbol, text);
 
-      if (!baseData) throw new Error(`无法找到代码 "${rawSymbol}" 的有效股票信息。`);
+      if (!baseData) throw new Error(`未找到股票代码 "${rawSymbol}" 的有效数据，请检查代码拼写。`);
 
-      // 阶段 2：计算 MA5/10/20 及 RSI 指标
-      await sendEvent('progress', { percent: 65, message: `[2/3] 计算均线 (MA5/10/20) 与 RSI 技术指标...` });
+      // 阶段 2：计算历史均线 (MA) 与 RSI 指标
+      await sendEvent('progress', { percent: 65, message: `[2/3] 计算均线与 RSI 技术指标...` });
       
-      const klineRes = await fetch(`https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${targetSymbol},day,,,30,qfq`);
-      let technicals = { ma5: 'N/A', ma10: 'N/A', ma20: 'N/A', rsi14: 'N/A', trend: '震荡整理', sector: '通用板块' };
-
-      if (klineRes.ok) {
-        const klineJson = await klineRes.json();
-        const stockKey = Object.keys(klineJson.data || {})[0];
-        const kdata = klineJson.data?.[stockKey]?.day || klineJson.data?.[stockKey]?.qfqday;
-        if (kdata && kdata.length > 0) {
-          technicals = calculateTechnicalIndicators(kdata);
+      let technicals = { ma5: 'N/A', ma10: 'N/A', ma20: 'N/A', rsi14: 'N/A', trend: '震荡整理', sector: '主板板块' };
+      try {
+        const klineRes = await fetch(`https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${targetSymbol},day,,,30,qfq`);
+        if (klineRes.ok) {
+          const klineJson = await klineRes.json();
+          const stockKey = Object.keys(klineJson.data || {})[0];
+          const kdata = klineJson.data?.[stockKey]?.day || klineJson.data?.[stockKey]?.qfqday;
+          if (kdata && kdata.length > 0) {
+            technicals = calculateTechnicalIndicators(kdata);
+          }
         }
+      } catch (_) {
+        // 忽略 K 线接口异常，使用默认展示
       }
 
-      // 阶段 3：整合数据并输出
-      await sendEvent('progress', { percent: 95, message: `[3/3] 生成分析仪表盘...` });
+      // 阶段 3：输出完整数据
+      await sendEvent('progress', { percent: 95, message: `[3/3] 生成仪表盘...` });
       
       const finalResult = { ...baseData, ...technicals };
 
@@ -236,7 +240,7 @@ function calculateTechnicalIndicators(kdata) {
     else if (current < parseFloat(ma5) && parseFloat(ma5) < parseFloat(ma20)) trend = '空头排列 (看跌)';
   }
 
-  return { ma5, ma10, ma20, rsi14, trend, sector: '资本市场与核心板块' };
+  return { ma5, ma10, ma20, rsi14, trend, sector: '主板金融与核心板块' };
 }
 
 /**
@@ -254,7 +258,6 @@ function getHTMLPage() {
 </head>
 <body class="bg-slate-900 text-slate-100 min-h-screen">
 
-  <!-- 登录模态框 -->
   <div id="loginModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50">
     <div class="bg-slate-800 border border-slate-700 p-8 rounded-2xl w-full max-w-md shadow-2xl space-y-6">
       <div class="text-center">

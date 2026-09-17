@@ -4,3 +4,5 @@ compatibility_date = "2024-01-01"
 
 [vars]
 ENVIRONMENT = "production"
+ADMIN_USER = "admin"
+ADMIN_PASS = "admin123"
